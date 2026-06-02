@@ -1,7 +1,7 @@
 use eframe::egui;
 use chrono::Datelike;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use rusqlite::Connection;
+use std::fs;
 
 fn get_template(template_type: &str) -> Vec<&'static str> {
     match template_type {
@@ -21,27 +21,197 @@ fn get_template(template_type: &str) -> Vec<&'static str> {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Feature {
     id: String,
     title: String,
     description: String,
-    #[serde(default)]
     completed: bool,
-    #[serde(default = "default_status")]
     status: String,
-    #[serde(default = "default_color")]
     color: String,
 }
 
-fn default_status() -> String { "Planned".into() }
-fn default_color() -> String { "#FF9800".into() }
+const DB_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS roadmap (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarter (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    roadmap_id INTEGER NOT NULL REFERENCES roadmap(id) ON DELETE CASCADE,
+    year INTEGER NOT NULL,
+    quarter INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feature (
+    id TEXT PRIMARY KEY,
+    quarter_id INTEGER NOT NULL REFERENCES quarter(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'Planned',
+    color TEXT NOT NULL DEFAULT '#FF9800',
+    sort_order INTEGER NOT NULL
+);
+";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+fn db_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".allroads")
+}
+
+fn key_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".allroads.key")
+}
+
+fn generate_key() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    hex::encode(bytes)
+}
+
+fn load_or_create_key() -> Result<String, String> {
+    let path = key_path();
+    if path.exists() {
+        fs::read_to_string(&path).map_err(|e| format!("Error reading key: {}", e))
+    } else {
+        let key = generate_key();
+        fs::write(&path, &key).map_err(|e| format!("Error writing key: {}", e))?;
+        Ok(key)
+    }
+}
+
+const KEYCHAIN_SERVICE: &str = "allroads";
+const KEYCHAIN_USERNAME: &str = "db-encryption-key";
+
+fn keyring_entry() -> keyring::Entry {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USERNAME).expect("Failed to create keyring entry")
+}
+
+fn load_key_from_keychain() -> Result<String, String> {
+    let entry = keyring_entry();
+    entry.get_password().map_err(|e| format!("Error reading key from keychain: {}", e))
+}
+
+fn save_key_to_keychain(key: &str) -> Result<(), String> {
+    let entry = keyring_entry();
+    entry.set_password(key).map_err(|e| format!("Error saving key to keychain: {}", e))
+}
+
+fn delete_key_from_keychain() -> Result<(), String> {
+    let entry = keyring_entry();
+    entry.delete_password().map_err(|e| format!("Error deleting key from keychain: {}", e))
+}
+
+fn load_or_create_key_with_keychain(use_keychain: bool) -> Result<String, String> {
+    if use_keychain {
+        match load_key_from_keychain() {
+            Ok(key) => Ok(key),
+            Err(_) => {
+                let key = if key_path().exists() {
+                    load_or_create_key()?
+                } else {
+                    generate_key()
+                };
+                save_key_to_keychain(&key)?;
+                Ok(key)
+            }
+        }
+    } else {
+        load_or_create_key()
+    }
+}
+
+fn open_connection(encrypted: bool, use_keychain: bool) -> Result<(Connection, Option<String>), String> {
+    open_connection_at_path(&db_path(), encrypted, use_keychain)
+}
+
+fn open_connection_at_path(path: &std::path::PathBuf, encrypted: bool, use_keychain: bool) -> Result<(Connection, Option<String>), String> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(|e| e.to_string())?;
+    let mut db_key = None;
+    if encrypted {
+        let key = load_or_create_key_with_keychain(use_keychain)?;
+        conn.execute_batch(&format!("PRAGMA key = \"{}\";", key)).map_err(|e| e.to_string())?;
+        conn.execute_batch("PRAGMA cipher = 'aes-256-cbc';").map_err(|e| e.to_string())?;
+        db_key = Some(key);
+    }
+    conn.execute_batch(DB_SCHEMA).map_err(|e| e.to_string())?;
+    Ok((conn, db_key))
+}
+
+fn db_list_roadmaps(conn: &Connection) -> Vec<(i64, String)> {
+    let mut stmt = conn.prepare("SELECT id, name FROM roadmap ORDER BY updated_at DESC").unwrap();
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+fn db_create_roadmap(conn: &Connection, name: &str) -> i64 {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute("INSERT INTO roadmap (name, created_at, updated_at) VALUES (?1, ?2, ?3)", rusqlite::params![name, now, now]).unwrap();
+    conn.last_insert_rowid()
+}
+
+fn db_delete_roadmap(conn: &Connection, id: i64) {
+    conn.execute("DELETE FROM roadmap WHERE id = ?1", rusqlite::params![id]).unwrap();
+}
+
+fn db_rename_roadmap(conn: &Connection, id: i64, name: &str) {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute("UPDATE roadmap SET name = ?1, updated_at = ?2 WHERE id = ?3", rusqlite::params![name, now, id]).unwrap();
+}
+
+fn db_save_roadmap(conn: &Connection, roadmap_id: i64, quarters: &[Quarter]) {
+    let now = chrono::Local::now().to_rfc3339();
+    conn.execute("UPDATE roadmap SET updated_at = ?1 WHERE id = ?2", rusqlite::params![now, roadmap_id]).unwrap();
+    conn.execute("DELETE FROM quarter WHERE roadmap_id = ?1", rusqlite::params![roadmap_id]).unwrap();
+    for (qi, q) in quarters.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO quarter (roadmap_id, year, quarter, sort_order) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![roadmap_id, q.year, q.quarter, qi as i64],
+        ).unwrap();
+        let quarter_id = conn.last_insert_rowid();
+        for (fi, f) in q.features.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO feature (id, quarter_id, title, description, completed, status, color, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![f.id, quarter_id, f.title, f.description, f.completed as i32, f.status, f.color, fi as i64],
+            ).unwrap();
+        }
+    }
+}
+
+fn db_load_roadmap(conn: &Connection, roadmap_id: i64) -> Vec<Quarter> {
+    let mut q_stmt = conn.prepare("SELECT id, year, quarter FROM quarter WHERE roadmap_id = ?1 ORDER BY sort_order").unwrap();
+    let q_rows: Vec<_> = q_stmt.query_map(rusqlite::params![roadmap_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?))
+    }).unwrap().filter_map(|r| r.ok()).collect();
+
+    let mut quarters = Vec::new();
+    for (qid, year, quarter) in q_rows {
+        let mut f_stmt = conn.prepare("SELECT id, title, description, completed, status, color FROM feature WHERE quarter_id = ?1 ORDER BY sort_order").unwrap();
+        let features: Vec<Feature> = f_stmt.query_map(rusqlite::params![qid], |row| {
+            let completed: i32 = row.get(3)?;
+            Ok(Feature {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                description: row.get(2)?,
+                completed: completed != 0,
+                status: row.get(4)?,
+                color: row.get(5)?,
+            })
+        }).unwrap().filter_map(|r| r.ok()).collect();
+        quarters.push(Quarter { year, quarter, features });
+    }
+    quarters
+}
+
+#[derive(Clone, Debug)]
 struct Quarter {
     year: u32,
     quarter: u32,
-    #[serde(default)]
     features: Vec<Feature>,
 }
 
@@ -68,11 +238,6 @@ impl Quarter {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct RoadmapFile {
-    quarters: Vec<Quarter>,
-}
-
 struct FeatureDialogState {
     title: String,
     description: String,
@@ -86,7 +251,7 @@ impl Default for FeatureDialogState {
             title: String::new(),
             description: String::new(),
             status: "Planned".into(),
-            color: default_color(),
+            color: "#FF9800".into(),
         }
     }
 }
@@ -141,7 +306,7 @@ impl FeatureDialogState {
                     );
                     ui.painter().rect_filled(rect, 2.0, *egui_color);
                     if self.color == *hex {
-                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
                     }
                     if response.clicked() {
                         self.color = hex.to_string();
@@ -200,25 +365,171 @@ enum DialogAction {
 
 struct RoadmapApp {
     quarters: Vec<Quarter>,
-    current_file: Option<PathBuf>,
+    db: Connection,
+    current_roadmap_id: Option<i64>,
+    roadmap_list: Vec<(i64, String)>,
     status_text: String,
     dialog_state: DialogState,
-}
-
-impl Default for RoadmapApp {
-    fn default() -> Self {
-        let mut app = Self {
-            quarters: Vec::new(),
-            current_file: None,
-            status_text: "Ready".into(),
-            dialog_state: DialogState::None,
-        };
-        app.initialize_quarters();
-        app
-    }
+    encrypted: bool,
+    use_keychain: bool,
+    db_key: Option<String>,
+    new_roadmap_name: String,
+    show_open_dialog: bool,
+    show_new_dialog: bool,
+    rename_roadmap_id: Option<i64>,
+    rename_roadmap_name: String,
 }
 
 impl RoadmapApp {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
+        let key_file = key_path();
+        let (conn, encrypted, use_keychain, db_key) = if key_file.exists() {
+            let (conn, key) = open_connection(true, false)?;
+            (conn, true, false, key)
+        } else if let Ok((conn, _)) = open_connection(false, false) {
+            (conn, false, false, None)
+        } else if let Ok((conn, key)) = open_connection(true, true) {
+            (conn, true, true, key)
+        } else {
+            return Err("Could not open database: not unencrypted, no key file, no keychain entry".into());
+        };
+        let roadmap_list = db_list_roadmaps(&conn);
+        let mut app = Self {
+            quarters: Vec::new(),
+            db: conn,
+            current_roadmap_id: None,
+            roadmap_list,
+            status_text: "Ready".into(),
+            dialog_state: DialogState::None,
+            encrypted,
+            use_keychain,
+            db_key,
+            new_roadmap_name: String::new(),
+            show_open_dialog: false,
+            show_new_dialog: false,
+            rename_roadmap_id: None,
+            rename_roadmap_name: String::new(),
+        };
+        app.initialize_quarters();
+        app.new_roadmap_name = "default".into();
+        Ok(app)
+    }
+
+    fn toggle_encryption(&mut self) {
+        let want_encrypted = self.encrypted;
+        let use_keychain = self.use_keychain;
+        let new_path = std::path::PathBuf::from(format!("{}.new", db_path().display()));
+        if new_path.exists() {
+            let _ = std::fs::remove_file(&new_path);
+        }
+
+        let mut roadmaps: Vec<(i64, String, String, String)> = Vec::new();
+        {
+            let mut stmt = self.db.prepare("SELECT id, name, created_at, updated_at FROM roadmap").unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+            for r in rows.flatten() { roadmaps.push(r); }
+        }
+
+        let mut quarters: Vec<(i64, i64, u32, u32, i64)> = Vec::new();
+        {
+            let mut stmt = self.db.prepare("SELECT id, roadmap_id, year, quarter, sort_order FROM quarter ORDER BY sort_order").unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+            for r in rows.flatten() { quarters.push(r); }
+        }
+
+        let mut features: Vec<(String, i64, String, String, i32, String, String, i64)> = Vec::new();
+        {
+            let mut stmt = self.db.prepare("SELECT id, quarter_id, title, description, completed, status, color, sort_order FROM feature ORDER BY sort_order").unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))).unwrap();
+            for r in rows.flatten() { features.push(r); }
+        }
+
+        let old_db = std::mem::replace(&mut self.db, Connection::open_in_memory().unwrap());
+        drop(old_db);
+
+        match open_connection_at_path(&new_path, want_encrypted, use_keychain) {
+            Ok((new_conn, _)) => {
+                for (id, name, created, updated) in &roadmaps {
+                    new_conn.execute("INSERT INTO roadmap (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![id, name, created, updated]).unwrap();
+                }
+                for (id, roadmap_id, year, quarter, sort_order) in &quarters {
+                    new_conn.execute("INSERT INTO quarter (id, roadmap_id, year, quarter, sort_order) VALUES (?1, ?2, ?3, ?4, ?5)", rusqlite::params![id, roadmap_id, year, quarter, sort_order]).unwrap();
+                }
+                for (id, quarter_id, title, desc, completed, status, color, sort_order) in &features {
+                    new_conn.execute("INSERT INTO feature (id, quarter_id, title, description, completed, status, color, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", rusqlite::params![id, quarter_id, title, desc, completed, status, color, sort_order]).unwrap();
+                }
+
+                new_conn.close().unwrap();
+
+                let old_path = db_path();
+                let _ = std::fs::remove_file(&old_path);
+                std::fs::rename(&new_path, &old_path).unwrap();
+
+                match open_connection(want_encrypted, use_keychain) {
+                    Ok((conn, key)) => {
+                        self.encrypted = want_encrypted;
+                        self.db = conn;
+                        self.db_key = key;
+                        self.roadmap_list = db_list_roadmaps(&self.db);
+                        self.status_text = if self.encrypted { "Encryption enabled".into() } else { "Encryption disabled".into() };
+                    }
+                    Err(e) => {
+                        self.status_text = format!("Error reopening DB: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&new_path);
+                match open_connection(self.encrypted, self.use_keychain) {
+                    Ok((conn, _)) => { self.db = conn; }
+                    Err(_) => {}
+                }
+                self.status_text = format!("Error migrating DB: {}", e);
+            }
+        }
+    }
+
+    fn toggle_keychain(&mut self) {
+        let want_keychain = self.use_keychain;
+        if want_keychain {
+            let key = match &self.db_key {
+                Some(k) => k.clone(),
+                None => match load_or_create_key() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        self.use_keychain = false;
+                        self.status_text = format!("Error reading key for keychain: {}", e);
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = save_key_to_keychain(&key) {
+                self.use_keychain = false;
+                self.status_text = e;
+                return;
+            }
+            self.db_key = Some(key);
+            let _ = fs::remove_file(key_path());
+            self.status_text = "Key stored in system keychain".into();
+        } else {
+            let key = match &self.db_key {
+                Some(k) => k.clone(),
+                None => {
+                    self.use_keychain = true;
+                    self.status_text = "No cached key available".into();
+                    return;
+                }
+            };
+            if let Err(e) = fs::write(key_path(), &key) {
+                self.use_keychain = true;
+                self.status_text = format!("Error writing key to file: {}", e);
+                return;
+            }
+            let _ = delete_key_from_keychain();
+            self.status_text = "Key removed from system keychain".into();
+        }
+    }
+
     fn initialize_quarters(&mut self) {
         let now = chrono::Local::now();
         let current_year = now.year() as u32;
@@ -255,50 +566,45 @@ impl RoadmapApp {
     }
 
     fn new_roadmap(&mut self) {
+        if self.new_roadmap_name.trim().is_empty() {
+            self.status_text = "Enter a roadmap name first".into();
+            return;
+        }
+        let id = db_create_roadmap(&self.db, &self.new_roadmap_name);
         self.quarters.clear();
-        self.current_file = None;
         self.initialize_quarters();
-        self.status_text = "New roadmap created".into();
+        self.current_roadmap_id = Some(id);
+        db_save_roadmap(&self.db, id, &self.quarters);
+        self.roadmap_list = db_list_roadmaps(&self.db);
+        self.status_text = format!("Created roadmap: {}", self.new_roadmap_name);
+        self.new_roadmap_name.clear();
     }
 
     fn open_roadmap(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
-            match std::fs::read_to_string(&path) {
-                Ok(data) => match serde_json::from_str::<RoadmapFile>(&data) {
-                    Ok(file) => {
-                        self.quarters = file.quarters;
-                        self.current_file = Some(path);
-                        self.status_text = "Opened roadmap".into();
-                    }
-                    Err(e) => self.status_text = format!("Error parsing: {}", e),
-                },
-                Err(e) => self.status_text = format!("Error reading: {}", e),
-            }
+        self.roadmap_list = db_list_roadmaps(&self.db);
+        self.show_open_dialog = true;
+    }
+
+    fn open_roadmap_by_id(&mut self, id: i64) {
+        self.quarters = db_load_roadmap(&self.db, id);
+        self.current_roadmap_id = Some(id);
+        if let Some(name) = self.roadmap_list.iter().find(|(rid, _)| *rid == id).map(|(_, n)| n.clone()) {
+            self.status_text = format!("Opened: {}", name);
         }
+        self.show_open_dialog = false;
     }
 
     fn save_roadmap(&mut self) {
-        if let Some(ref path) = self.current_file {
-            self.save_to_file(path.clone());
+        if let Some(id) = self.current_roadmap_id {
+            db_save_roadmap(&self.db, id, &self.quarters);
+            self.status_text = "Saved roadmap".into();
         } else {
-            self.save_as_roadmap();
-        }
-    }
-
-    fn save_as_roadmap(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name("roadmap.json").save_file() {
-            self.save_to_file(path);
-        }
-    }
-
-    fn save_to_file(&mut self, path: PathBuf) {
-        let file = RoadmapFile { quarters: self.quarters.clone() };
-        match serde_json::to_string_pretty(&file) {
-            Ok(json) => match std::fs::write(&path, json) {
-                Ok(_) => { self.current_file = Some(path); self.status_text = "Saved roadmap".into(); }
-                Err(e) => self.status_text = format!("Error saving: {}", e),
-            },
-            Err(e) => self.status_text = format!("Error serializing: {}", e),
+            let name = if self.new_roadmap_name.trim().is_empty() { "default".to_string() } else { self.new_roadmap_name.trim().to_string() };
+            let id = db_create_roadmap(&self.db, &name);
+            db_save_roadmap(&self.db, id, &self.quarters);
+            self.current_roadmap_id = Some(id);
+            self.roadmap_list = db_list_roadmaps(&self.db);
+            self.status_text = format!("Created and saved roadmap: {}", name);
         }
     }
 
@@ -359,10 +665,37 @@ impl eframe::App for RoadmapApp {
                 ui.label(egui::RichText::new("allroads").strong().size(14.0));
                 ui.add_space(16.0);
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() { self.new_roadmap(); ui.close_menu(); }
+                    if ui.button("New").clicked() { self.show_new_dialog = true; ui.close_menu(); }
                     if ui.button("Open").clicked() { self.open_roadmap(); ui.close_menu(); }
                     if ui.button("Save").clicked() { self.save_roadmap(); ui.close_menu(); }
-                    if ui.button("Save As").clicked() { self.save_as_roadmap(); ui.close_menu(); }
+                    ui.separator();
+                    ui.menu_button("Settings", |ui| {
+                        if ui.checkbox(&mut self.encrypted, "Enable AES Encryption").changed() {
+                            self.toggle_encryption();
+                        }
+                        let keychain_enabled = self.encrypted;
+                        let mut use_keychain = self.use_keychain;
+                        let response = ui.add_enabled(keychain_enabled, egui::Checkbox::new(&mut use_keychain, "Use System Keychain"));
+                        let response = if !keychain_enabled {
+                            response.on_hover_text("Enable encryption first")
+                        } else {
+                            response
+                        };
+                        if response.changed() {
+                            self.use_keychain = use_keychain;
+                            self.toggle_keychain();
+                        }
+                        if ui.button("Rename Roadmap").clicked() {
+                            if let Some(id) = self.current_roadmap_id {
+                                self.rename_roadmap_id = Some(id);
+                                if let Some(name) = self.roadmap_list.iter().find(|(rid, _)| *rid == id).map(|(_, n)| n.clone()) {
+                                    self.rename_roadmap_name = name;
+                                }
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
                     if ui.button("Exit").clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
                 });
                 ui.menu_button("Templates", |ui| {
@@ -405,7 +738,7 @@ impl eframe::App for RoadmapApp {
 
                 for (qi, quarter) in &mut self.quarters.iter_mut().enumerate() {
                     egui::Frame::group(ui.style())
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)))
+                        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 180, 180)))
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
@@ -427,7 +760,7 @@ impl eframe::App for RoadmapApp {
 
                                 for (fi, feature) in quarter.features.iter().enumerate() {
                                     egui::Frame::none()
-                                        .stroke(egui::Stroke::new(0.5, egui::Color32::from_rgb(200, 200, 200)))
+                                        .stroke(egui::Stroke::new(0.5_f32, egui::Color32::from_rgb(200, 200, 200)))
                                         .inner_margin(4.0)
                                         .outer_margin(0.0)
                                         .show(ui, |ui| {
@@ -541,7 +874,7 @@ impl eframe::App for RoadmapApp {
                 let qi = *quarter_idx;
                 egui::Window::new("Add Feature").collapsible(false).resizable(false).show(ctx, |ui| {
                     if dialog.show(ui) {
-                        if let Some(feat) = dialog.to_feature(&format!("feature_{}", self.quarters[qi].features.len())) {
+                        if let Some(feat) = dialog.to_feature(&format!("f_{}", rand::random::<u64>())) {
                             self.quarters[qi].features.push(feat);
                             self.status_text = format!("Added feature: {}", self.quarters[qi].features.last().unwrap().title);
                         }
@@ -552,6 +885,7 @@ impl eframe::App for RoadmapApp {
                     }
                 });
             }
+
             DialogState::EditFeature { quarter_idx, feature_idx, dialog } => {
                 let (qi, fi) = (*quarter_idx, *feature_idx);
                 let existing_id = self.quarters[qi].features[fi].id.clone();
@@ -568,6 +902,7 @@ impl eframe::App for RoadmapApp {
                     }
                 });
             }
+
             DialogState::EditStatus { quarter_idx, feature_idx } => {
                 let (qi, fi) = (*quarter_idx, *feature_idx);
                 let mut status = self.quarters[qi].features[fi].status.clone();
@@ -596,10 +931,79 @@ impl eframe::App for RoadmapApp {
         if close_dialog {
             self.dialog_state = DialogState::None;
         }
+        
         if let Some((qi, fi, status)) = new_status {
             self.quarters[qi].features[fi].status = status.clone();
             self.quarters[qi].features[fi].completed = status == "Completed";
             self.status_text = format!("Updated status to: {}", status);
+        }
+
+        if self.show_open_dialog {
+            let mut open_id = None;
+            let mut delete_id = None;
+            egui::Window::new("Open Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+                if self.roadmap_list.is_empty() {
+                    ui.label("No roadmaps found.");
+                }
+                for (id, name) in &self.roadmap_list.clone() {
+                    ui.horizontal(|ui| {
+                        if ui.button(name).clicked() {
+                            open_id = Some(*id);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete_id = Some(*id);
+                        }
+                    });
+                }
+                ui.separator();
+                if ui.button("Cancel").clicked() {
+                    self.show_open_dialog = false;
+                }
+            });
+            if let Some(id) = delete_id {
+                db_delete_roadmap(&self.db, id);
+                self.roadmap_list = db_list_roadmaps(&self.db);
+                if self.current_roadmap_id == Some(id) {
+                    self.current_roadmap_id = None;
+                    self.quarters.clear();
+                }
+            }
+            if let Some(id) = open_id {
+                self.open_roadmap_by_id(id);
+            }
+        }
+
+        if self.show_new_dialog {
+            egui::Window::new("New Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("Roadmap name:");
+                ui.text_edit_singleline(&mut self.new_roadmap_name);
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() {
+                        self.new_roadmap();
+                        self.show_new_dialog = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_new_dialog = false;
+                    }
+                });
+            });
+        }
+
+        if let Some(rid) = self.rename_roadmap_id {
+            egui::Window::new("Rename Roadmap").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("New name:");
+                ui.text_edit_singleline(&mut self.rename_roadmap_name);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        db_rename_roadmap(&self.db, rid, &self.rename_roadmap_name);
+                        self.roadmap_list = db_list_roadmaps(&self.db);
+                        self.rename_roadmap_id = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.rename_roadmap_id = None;
+                    }
+                });
+            });
         }
     }
 }
@@ -608,13 +1012,16 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
-            .with_title("AllRoads v1.0")
+            .with_title("allroads v1.1")
             .with_decorations(false),
         ..Default::default()
     };
     eframe::run_native(
         "AllRoads",
         options,
-        Box::new(|_cc| Ok(Box::new(RoadmapApp::default()))),
+        Box::new(|cc| match RoadmapApp::new(cc) {
+            Ok(app) => Ok(Box::new(app)),
+            Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+        }),
     )
 }
