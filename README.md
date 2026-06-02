@@ -3,13 +3,13 @@
 
 
 ---
-<p>allroads</p>
+# allroads
 
 latest working version. 
 <br/>
-<sup>ported from python to rust.</sup>
+<sup>now rewritten in rust.</sup>
 
-features:
+### features:
 - quarterly roadmap tracking. add and remove quarters as needed
 - color coded tasks/features with descriptions
 - 4 stages of development (planned, developing, testing, and completed)
@@ -19,7 +19,24 @@ features:
 - saved in .json format
 - completely redone, clean, rust based ui
 
-compiling:
+### coming soon:
+- **time management and statistics:**
+  - record expected and actual task length
+  - record actual start/end date of tasks
+  - new timeline view to help visualize project
+  - keep, view, and graph productivity stats
+
+- **synchronization and organizations:**
+  - build/join organizational charts
+  - assign tasks to users 
+  - uses simple token-based access
+
+- **model context protocol:**
+  - enable LLM interaction with allroads
+  - AIs will be able to join organizations
+  - assign tasks to agents and view outcomes
+
+### compiling:
 ```
 cd allroads && cargo build --release
 ```
