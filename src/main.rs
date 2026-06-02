@@ -381,10 +381,7 @@ struct RoadmapApp {
 }
 
 impl RoadmapApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        cc.egui_ctx.set_style(style);
+    fn new(_cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
         let key_file = key_path();
         let (conn, encrypted, use_keychain, db_key) = if key_file.exists() {
             let (conn, key) = open_connection(true, false)?;
