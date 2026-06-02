@@ -17,4 +17,15 @@ opt-level = 1
 
 [profile.release]
 opt-level = 1
+codegen-units = 1
 strip = true
+
+[package.metadata.bundle]
+name = "allroads"
+identifier = "com.allroads.app"
+icon = ["icon.icns"]
+version = "1.1.0"
+category = "Productivity"
+short_description = "roadmap planning tool"
+long_description = "a roadmap planning tool with timeline views and feature tracking"
+osx_minimum_system_version = "10.14"
