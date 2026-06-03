@@ -1,7 +1,9 @@
 [package]
 name = "allroads"
-version = "1.1.0"
-edition = "2021"
+version = "1.2.0"
+edition = "2024"
+description = "a rust-based roadmap viewer and project management tool"
+license = "MIT"
 
 [dependencies]
 eframe = "0.29"
@@ -19,13 +21,15 @@ opt-level = 1
 opt-level = 1
 codegen-units = 1
 strip = true
+lto = true
+debug = false
 
 [package.metadata.bundle]
 name = "allroads"
-identifier = "com.allroads.app"
+identifier = "com.vertigo.allroads.app"
 icon = ["icon.icns"]
-version = "1.1.0"
+version = "1.2.0"
 category = "Productivity"
 short_description = "roadmap planning tool"
-long_description = "a roadmap planning tool with timeline views and feature tracking"
+long_description = "a rust-based roadmap viewer and project management tool"
 osx_minimum_system_version = "10.14"
