@@ -20,9 +20,7 @@ latest working version.
 - completely redone, clean, rust based ui
 
 ### coming soon:
-- **time management and statistics:**
-  - record expected and actual task length
-  - record actual start/end date of tasks
+- **statistics:**
   - keep, view, and graph productivity stats
 
 - **synchronization and organizations:**
