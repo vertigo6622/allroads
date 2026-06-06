@@ -36,5 +36,6 @@ latest working version.
 
 ### compiling:
 ```
-cd allroads && cargo build --release
+cd allroads && cargo +nightly build --release
 ```
+<sup>requires rust nightly for rusqlite 0.40</sup>
