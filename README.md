@@ -23,15 +23,15 @@ latest working version.
 - move tasks up and down, and between quarters
 - completely redone, clean, rust based ui
 
-### coming soon:
-- **statistics:**
-  - keep, view, and graph productivity stats
-
-- **org synchronization:**
+- **networking:**
   - join organizational charts and sync between team members
   - assign tasks and be assigned tasks
   - collaborate and track large-scale team projects
   - use simple token-based access
+
+### coming soon:
+- **statistics:**
+  - keep, view, and graph productivity stats
 
 - **model context protocol:**
   - enable LLM interaction with allroads
