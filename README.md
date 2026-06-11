@@ -22,7 +22,6 @@ latest working version.
 - option to store database encryption key in keychain
 - move tasks up and down, and between quarters
 - completely redone, clean, rust based ui
-
 - **networking:**
   - join organizational charts and sync between team members
   - assign tasks and be assigned tasks
